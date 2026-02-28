@@ -11,6 +11,7 @@ if ! command -v zip >/dev/null 2>&1; then
 fi
 
 mkdir -p "$(dirname "$OUT_FILE")"
+rm -f "$OUT_FILE"
 
 STAGE_DIR="$(mktemp -d)"
 cleanup() {
@@ -20,7 +21,10 @@ trap cleanup EXIT
 
 cp "$ROOT_DIR/__init__.py" "$STAGE_DIR/"
 cp "$ROOT_DIR/manifest.json" "$STAGE_DIR/"
-cp -R "$ROOT_DIR/fsrs_merge_advisor" "$STAGE_DIR/"
+rsync -a \
+  --exclude '__pycache__/' \
+  --exclude '*.pyc' \
+  "$ROOT_DIR/fsrs_merge_advisor/" "$STAGE_DIR/fsrs_merge_advisor/"
 
 (
   cd "$STAGE_DIR"

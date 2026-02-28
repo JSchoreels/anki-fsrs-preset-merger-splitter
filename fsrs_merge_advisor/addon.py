@@ -25,7 +25,34 @@ def _deck_entries() -> list[tuple[int, str]]:
     return entries
 
 
-def _config_from_conf_id(conf_id: int) -> Mapping[str, Any] | None:
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _field(obj: Any, name: str) -> Any:
+    if isinstance(obj, Mapping):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _field_any(obj: Any, names: Sequence[str]) -> Any:
+    for name in names:
+        value = _field(obj, name)
+        if value is not None:
+            return value
+    return None
+
+
+def _config_name(conf_id: int, config: Any) -> str:
+    name = _field(config, "name")
+    return str(name) if isinstance(name, str) and name else f"Preset {conf_id}"
+
+
+def _config_from_conf_id(conf_id: int) -> Any:
     getter_names = ["get_config", "get_config_dict", "dconf_for_update_dict", "getconf"]
     for getter_name in getter_names:
         getter = getattr(mw.col.decks, getter_name, None)
@@ -35,45 +62,41 @@ def _config_from_conf_id(conf_id: int) -> Mapping[str, Any] | None:
             value = getter(conf_id)
         except Exception:
             continue
-        if isinstance(value, Mapping):
+        if value is not None:
             return value
     return None
 
 
-def _config_for_deck(deck_id: int) -> Mapping[str, Any] | None:
+def _config_for_deck(deck_id: int) -> Any:
     by_deck = getattr(mw.col.decks, "config_dict_for_deck_id", None)
     if by_deck is not None:
         try:
             value = by_deck(deck_id)
-            if isinstance(value, Mapping):
+            if value is not None:
                 return value
         except Exception:
             pass
 
     deck = mw.col.decks.get(deck_id)
-    if not isinstance(deck, Mapping):
-        return None
-
-    conf_id = deck.get("conf")
+    conf_id = _field_any(deck, ("conf", "config_id"))
     if isinstance(conf_id, int):
         return _config_from_conf_id(conf_id)
 
     return None
 
 
-def _normalize_config(config: Any) -> tuple[int, str, Mapping[str, Any]] | None:
-    if not isinstance(config, Mapping):
+def _normalize_config(config: Any, fallback_id: Any = None) -> tuple[int, str, Any] | None:
+    conf_id = _as_int(_field(config, "id"))
+    if conf_id is None:
+        conf_id = _as_int(fallback_id)
+    if conf_id is None:
         return None
-    conf_id = config.get("id")
-    if not isinstance(conf_id, int):
-        return None
-    name = config.get("name")
-    conf_name = str(name) if isinstance(name, str) and name else f"Preset {conf_id}"
+    conf_name = _config_name(conf_id, config)
     return conf_id, conf_name, config
 
 
-def _all_preset_configs() -> list[tuple[int, str, Mapping[str, Any]]]:
-    seen: dict[int, tuple[str, Mapping[str, Any]]] = {}
+def _all_preset_configs() -> list[tuple[int, str, Any]]:
+    seen: dict[int, tuple[str, Any]] = {}
 
     getter_names = (
         "all_config",
@@ -92,18 +115,18 @@ def _all_preset_configs() -> list[tuple[int, str, Mapping[str, Any]]]:
             continue
 
         if isinstance(raw, Mapping):
-            configs = raw.values()
+            entries = list(raw.items())
         elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
-            configs = raw
+            entries = [(None, config) for config in raw]
         else:
             continue
 
-        for config in configs:
-            normalized = _normalize_config(config)
+        for key, config in entries:
+            normalized = _normalize_config(config, fallback_id=key)
             if normalized is None:
                 continue
-            conf_id, conf_name, conf_dict = normalized
-            seen[conf_id] = (conf_name, conf_dict)
+            conf_id, conf_name, conf_obj = normalized
+            seen[conf_id] = (conf_name, conf_obj)
 
     if seen:
         return sorted((conf_id, item[0], item[1]) for conf_id, item in seen.items())
@@ -111,19 +134,16 @@ def _all_preset_configs() -> list[tuple[int, str, Mapping[str, Any]]]:
     # Fallback for older API shapes: gather presets referenced by decks.
     for deck_id, _ in _deck_entries():
         deck = mw.col.decks.get(deck_id)
-        if not isinstance(deck, Mapping):
-            continue
-        conf_id = deck.get("conf")
-        if not isinstance(conf_id, int):
+        conf_id = _as_int(_field_any(deck, ("conf", "config_id")))
+        if conf_id is None:
             continue
         if conf_id in seen:
             continue
 
         config = _config_from_conf_id(conf_id)
-        if not isinstance(config, Mapping):
+        if config is None:
             continue
-        conf_name = config.get("name")
-        name = str(conf_name) if isinstance(conf_name, str) and conf_name else f"Preset {conf_id}"
+        name = _config_name(conf_id, config)
         seen[conf_id] = (name, config)
 
     return sorted((conf_id, item[0], item[1]) for conf_id, item in seen.items())

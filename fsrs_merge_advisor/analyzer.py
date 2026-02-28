@@ -45,6 +45,47 @@ def _to_float_tuple(values: Sequence[Any]) -> tuple[float, ...] | None:
     return converted if converted else None
 
 
+def _field(obj: Any, name: str) -> Any:
+    if isinstance(obj, Mapping):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _field_any(obj: Any, names: Sequence[str]) -> Any:
+    for name in names:
+        value = _field(obj, name)
+        if value is not None:
+            return value
+    return None
+
+
+def _iter_candidate_sequences(config: Any) -> list[Sequence[Any]]:
+    candidates: list[Sequence[Any]] = []
+
+    for name in (
+        "fsrsParams6",
+        "fsrs_params6",
+        "fsrsParams5",
+        "fsrs_params5",
+        "fsrsParams",
+        "fsrs_params",
+        "fsrsWeights",
+        "fsrs_weights",
+    ):
+        value = _field(config, name)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            candidates.append(value)
+
+    fsrs_obj = _field(config, "fsrs")
+    if fsrs_obj is not None:
+        for name in ("weights", "params", "parameters"):
+            nested = _field(fsrs_obj, name)
+            if isinstance(nested, Sequence) and not isinstance(nested, (str, bytes, bytearray)):
+                candidates.append(nested)
+
+    return candidates
+
+
 def recommend_shared_preset(
     parameter_count: int,
     nearest_distance: float | None,
@@ -56,26 +97,15 @@ def recommend_shared_preset(
     return nearest_distance < FSRS6_RECENCY_MAHALANOBIS_SHARED_PRESET_THRESHOLD
 
 
-def extract_fsrs_weights(config: Mapping[str, Any]) -> tuple[float, ...] | None:
-    """Try known config locations for FSRS weights across Anki versions."""
+def extract_fsrs_weights(config: Any) -> tuple[float, ...] | None:
+    """Try FSRS-specific config locations across Anki versions."""
     if not config:
         return None
 
-    candidates: list[Any] = [
-        config.get("fsrsWeights"),
-        config.get("weights"),
-        config.get("fsrs_params"),
-    ]
-
-    fsrs = config.get("fsrs")
-    if isinstance(fsrs, Mapping):
-        candidates.extend([fsrs.get("weights"), fsrs.get("params")])
-
-    for candidate in candidates:
-        if isinstance(candidate, Sequence) and not isinstance(candidate, (str, bytes, bytearray)):
-            converted = _to_float_tuple(candidate)
-            if converted is not None:
-                return converted
+    for candidate in _iter_candidate_sequences(config):
+        converted = _to_float_tuple(candidate)
+        if converted is not None:
+            return converted
 
     return None
 

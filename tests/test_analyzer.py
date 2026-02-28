@@ -7,9 +7,36 @@ from fsrs_merge_advisor.analyzer import (
 )
 
 
+class _ConfigObject:
+    def __init__(self, fsrs_weights):
+        self.fsrs_weights = fsrs_weights
+
+
 def test_extract_fsrs_weights_from_flat_key():
     config = {"fsrsWeights": [1, 2, 3]}
     assert extract_fsrs_weights(config) == (1.0, 2.0, 3.0)
+
+
+def test_extract_fsrs_weights_prefers_fsrs_params6_over_legacy_weights():
+    config = {
+        "fsrsWeights": [1] * 17,
+        "fsrsParams5": [2] * 19,
+        "fsrsParams6": [3] * 21,
+    }
+    assert extract_fsrs_weights(config) == tuple([3.0] * 21)
+
+
+def test_extract_fsrs_weights_falls_back_when_fsrs_params6_empty():
+    config = {
+        "fsrsParams6": [],
+        "fsrsParams5": [2] * 19,
+    }
+    assert extract_fsrs_weights(config) == tuple([2.0] * 19)
+
+
+def test_extract_fsrs_weights_from_object_attribute():
+    config = _ConfigObject([0.11, 0.22, 0.33])
+    assert extract_fsrs_weights(config) == (0.11, 0.22, 0.33)
 
 
 def test_extract_fsrs_weights_from_nested_key():
@@ -19,6 +46,16 @@ def test_extract_fsrs_weights_from_nested_key():
 
 def test_extract_fsrs_weights_rejects_invalid_sequence():
     config = {"fsrsWeights": [1, "x", 3]}
+    assert extract_fsrs_weights(config) is None
+
+
+def test_extract_fsrs_weights_does_not_use_generic_weights_field():
+    config = {"weights": [9, 9, 9], "fsrsWeights": [1, 2, 3]}
+    assert extract_fsrs_weights(config) == (1.0, 2.0, 3.0)
+
+
+def test_extract_fsrs_weights_ignores_non_fsrs_weights_when_no_fsrs_key():
+    config = {"weights": [9, 9, 9]}
     assert extract_fsrs_weights(config) is None
 
 
