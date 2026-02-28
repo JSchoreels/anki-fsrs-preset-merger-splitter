@@ -19,11 +19,12 @@ cleanup() {
 trap cleanup EXIT
 
 cp "$ROOT_DIR/__init__.py" "$STAGE_DIR/"
+cp "$ROOT_DIR/manifest.json" "$STAGE_DIR/"
 cp -R "$ROOT_DIR/fsrs_merge_advisor" "$STAGE_DIR/"
 
 (
   cd "$STAGE_DIR"
-  zip -qr "$OUT_FILE" __init__.py fsrs_merge_advisor
+  zip -qr "$OUT_FILE" __init__.py manifest.json fsrs_merge_advisor
 )
 
 echo "Created: $OUT_FILE"

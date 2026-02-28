@@ -6,11 +6,19 @@ TARGET_DIR="/Users/jschoreels/Library/Application Support/Anki2/addons21/anki-fs
 
 mkdir -p "$TARGET_DIR"
 
-rsync -a --delete \
-  --exclude '.git/' \
-  --exclude '.pytest_cache/' \
+STAGE_DIR="$(mktemp -d)"
+cleanup() {
+  rm -rf "$STAGE_DIR"
+}
+trap cleanup EXIT
+
+cp "$SOURCE_DIR/__init__.py" "$STAGE_DIR/"
+cp "$SOURCE_DIR/manifest.json" "$STAGE_DIR/"
+rsync -a \
   --exclude '__pycache__/' \
   --exclude '*.pyc' \
-  "$SOURCE_DIR/" "$TARGET_DIR/"
+  "$SOURCE_DIR/fsrs_merge_advisor/" "$STAGE_DIR/fsrs_merge_advisor/"
+
+rsync -a --delete "$STAGE_DIR/" "$TARGET_DIR/"
 
 echo "Addon synced to: $TARGET_DIR"
