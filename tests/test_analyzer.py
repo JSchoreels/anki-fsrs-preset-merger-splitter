@@ -52,8 +52,8 @@ def test_analyze_profiles_handles_single_profile_group():
 
 
 def test_recommend_shared_preset_threshold_logic():
-    assert recommend_shared_preset(parameter_count=21, nearest_distance=3.49) is True
-    assert recommend_shared_preset(parameter_count=21, nearest_distance=3.5) is False
+    assert recommend_shared_preset(parameter_count=21, nearest_distance=3.79) is True
+    assert recommend_shared_preset(parameter_count=21, nearest_distance=3.8) is False
     assert recommend_shared_preset(parameter_count=20, nearest_distance=2.0) is None
     assert recommend_shared_preset(parameter_count=21, nearest_distance=None) is None
 
