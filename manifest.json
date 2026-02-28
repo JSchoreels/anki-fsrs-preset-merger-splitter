@@ -1,0 +1,11 @@
+{
+    "name": "FSRS Preset Merger Splitter",
+    "package": "anki-fsrs-preset-merger-splitter",
+    "ankiweb_id": "",
+    "author": "",
+    "version": "0.1.0",
+    "homepage": "",
+    "conflicts": [],
+    "min_point_version": 0,
+    "max_point_version": 0
+}
