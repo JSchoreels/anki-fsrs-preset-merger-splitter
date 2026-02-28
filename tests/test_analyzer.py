@@ -1,9 +1,15 @@
+import math
+import pytest
+
 from fsrs_merge_advisor.analyzer import (
     FSRSProfile,
+    NOT_FSRS6_VALID_PARAMS_MESSAGE,
     analyze_profiles,
     extract_fsrs_weights,
+    is_fsrs6_valid_params,
     pairwise_distance_matrix,
     recommend_shared_preset,
+    transform_params_for_distance,
 )
 
 
@@ -59,11 +65,27 @@ def test_extract_fsrs_weights_ignores_non_fsrs_weights_when_no_fsrs_key():
     assert extract_fsrs_weights(config) is None
 
 
+def test_transform_params_for_distance_logs_first_four_params_only():
+    transformed = transform_params_for_distance((1.0, math.e, 10.0, 0.5, 7.0))
+    assert transformed == (
+        0.0,
+        1.0,
+        math.log(10.0),
+        math.log(0.5),
+        7.0,
+    )
+
+
+def test_transform_params_for_distance_handles_non_positive_values():
+    with pytest.raises(ValueError, match="strictly positive"):
+        transform_params_for_distance((0.0, -2.0, 3.0, 4.0, 5.0))
+
+
 def test_analyze_profiles_returns_nearest_deck_name():
     profiles = [
-        FSRSProfile(profile_id=1, profile_name="A", weights=(1.0, 2.0, 3.0)),
-        FSRSProfile(profile_id=2, profile_name="B", weights=(1.1, 2.1, 3.1)),
-        FSRSProfile(profile_id=3, profile_name="C", weights=(9.0, 9.0, 9.0)),
+        FSRSProfile(profile_id=1, profile_name="A", weights=tuple([1.0] * 21)),
+        FSRSProfile(profile_id=2, profile_name="B", weights=tuple([1.1] * 21)),
+        FSRSProfile(profile_id=3, profile_name="C", weights=tuple([9.0] * 21)),
     ]
 
     results = analyze_profiles(profiles)
@@ -86,6 +108,7 @@ def test_analyze_profiles_handles_single_profile_group():
     assert all(res.nearest_profile_name is None for res in results)
     assert all(res.nearest_distance is None for res in results)
     assert all(res.should_share_preset is None for res in results)
+    assert all(res.status_message == NOT_FSRS6_VALID_PARAMS_MESSAGE for res in results)
 
 
 def test_recommend_shared_preset_threshold_logic():
@@ -97,9 +120,9 @@ def test_recommend_shared_preset_threshold_logic():
 
 def test_pairwise_distance_matrix_same_length_profiles():
     profiles = [
-        FSRSProfile(profile_id=1, profile_name="A", weights=(1.0, 2.0, 3.0)),
-        FSRSProfile(profile_id=2, profile_name="B", weights=(1.1, 2.1, 3.1)),
-        FSRSProfile(profile_id=3, profile_name="C", weights=(9.0, 9.0, 9.0)),
+        FSRSProfile(profile_id=1, profile_name="A", weights=tuple([1.0] * 21)),
+        FSRSProfile(profile_id=2, profile_name="B", weights=tuple([1.1] * 21)),
+        FSRSProfile(profile_id=3, profile_name="C", weights=tuple([9.0] * 21)),
     ]
 
     ordered, matrix = pairwise_distance_matrix(profiles)
@@ -117,9 +140,9 @@ def test_pairwise_distance_matrix_same_length_profiles():
 
 def test_pairwise_distance_matrix_cross_dimension_is_none():
     profiles = [
-        FSRSProfile(profile_id=1, profile_name="A", weights=(1.0, 2.0)),
-        FSRSProfile(profile_id=2, profile_name="B", weights=(1.1, 2.1)),
-        FSRSProfile(profile_id=3, profile_name="C", weights=(1.0, 2.0, 3.0)),
+        FSRSProfile(profile_id=1, profile_name="A", weights=tuple([1.0] * 21)),
+        FSRSProfile(profile_id=2, profile_name="B", weights=tuple([1.1] * 21)),
+        FSRSProfile(profile_id=3, profile_name="C", weights=tuple([1.0] * 20)),
     ]
 
     ordered, matrix = pairwise_distance_matrix(profiles)
@@ -128,3 +151,8 @@ def test_pairwise_distance_matrix_cross_dimension_is_none():
     assert matrix[0][1] is not None
     assert matrix[0][2] is None
     assert matrix[1][2] is None
+
+
+def test_is_fsrs6_valid_params():
+    assert is_fsrs6_valid_params((1.0,) * 21) is True
+    assert is_fsrs6_valid_params((1.0,) * 20) is False

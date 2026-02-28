@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Mapping, Sequence
 
-from .distance import inverse_covariance_for_vectors, mahalanobis_distance
+from .distance import get_validated_fsrs6_inverse_covariance, mahalanobis_distance
 from .reference_covariance import (
     FSRS6_RECENCY_DIM,
     FSRS6_RECENCY_MAHALANOBIS_SHARED_PRESET_THRESHOLD,
 )
+
+_LOG_FIRST_PARAM_COUNT = 4
+NOT_FSRS6_VALID_PARAMS_MESSAGE = "Not FSRS6 valid params"
 
 
 @dataclass(frozen=True)
@@ -31,6 +35,7 @@ class DistanceResult:
     nearest_profile_name: str | None
     nearest_distance: float | None
     should_share_preset: bool | None
+    status_message: str | None = None
 
     @property
     def nearest_deck_name(self) -> str | None:
@@ -86,6 +91,24 @@ def _iter_candidate_sequences(config: Any) -> list[Sequence[Any]]:
     return candidates
 
 
+def transform_params_for_distance(
+    weights: Sequence[float],
+    *,
+    log_first_count: int = _LOG_FIRST_PARAM_COUNT,
+) -> tuple[float, ...]:
+    transformed = [float(value) for value in weights]
+    for idx in range(min(log_first_count, len(transformed))):
+        value = transformed[idx]
+        if value <= 0:
+            raise ValueError("Log transform requires strictly positive first FSRS params")
+        transformed[idx] = math.log(value)
+    return tuple(transformed)
+
+
+def is_fsrs6_valid_params(weights: Sequence[float]) -> bool:
+    return len(weights) == FSRS6_RECENCY_DIM
+
+
 def recommend_shared_preset(
     parameter_count: int,
     nearest_distance: float | None,
@@ -114,32 +137,40 @@ def analyze_profiles(profiles: Sequence[FSRSProfile]) -> list[DistanceResult]:
     if not profiles:
         return []
 
-    grouped: dict[int, list[FSRSProfile]] = {}
-    for profile in profiles:
-        grouped.setdefault(len(profile.weights), []).append(profile)
-
     results: list[DistanceResult] = []
-    for same_length_profiles in grouped.values():
-        if len(same_length_profiles) == 1:
-            only = same_length_profiles[0]
-            results.append(
-                DistanceResult(
-                    profile=only,
-                    nearest_profile_name=None,
-                    nearest_distance=None,
-                    should_share_preset=None,
-                )
+    valid_profiles = [profile for profile in profiles if is_fsrs6_valid_params(profile.weights)]
+    invalid_profiles = [profile for profile in profiles if not is_fsrs6_valid_params(profile.weights)]
+
+    for profile in invalid_profiles:
+        results.append(
+            DistanceResult(
+                profile=profile,
+                nearest_profile_name=None,
+                nearest_distance=None,
+                should_share_preset=None,
+                status_message=NOT_FSRS6_VALID_PARAMS_MESSAGE,
             )
-            continue
+        )
 
-        vectors = [list(p.weights) for p in same_length_profiles]
-        inv_cov = inverse_covariance_for_vectors(vectors)
+    if len(valid_profiles) == 1:
+        only = valid_profiles[0]
+        results.append(
+            DistanceResult(
+                profile=only,
+                nearest_profile_name=None,
+                nearest_distance=None,
+                should_share_preset=None,
+            )
+        )
+    elif len(valid_profiles) > 1:
+        vectors = [list(transform_params_for_distance(p.weights)) for p in valid_profiles]
+        inv_cov = get_validated_fsrs6_inverse_covariance(vectors)
 
-        for idx, profile in enumerate(same_length_profiles):
+        for idx, profile in enumerate(valid_profiles):
             nearest_name: str | None = None
             nearest_distance: float | None = None
 
-            for other_idx, other in enumerate(same_length_profiles):
+            for other_idx, other in enumerate(valid_profiles):
                 if idx == other_idx:
                     continue
 
@@ -170,25 +201,25 @@ def pairwise_distance_matrix(
     if not sorted_profiles:
         return [], []
 
-    by_length: dict[int, list[int]] = {}
-    for idx, profile in enumerate(sorted_profiles):
-        by_length.setdefault(len(profile.weights), []).append(idx)
-
     matrix: list[list[float | None]] = [
         [None for _ in range(len(sorted_profiles))] for _ in range(len(sorted_profiles))
     ]
-    for idx in range(len(sorted_profiles)):
+    valid_indexes = [
+        idx for idx, profile in enumerate(sorted_profiles) if is_fsrs6_valid_params(profile.weights)
+    ]
+
+    for idx in valid_indexes:
         matrix[idx][idx] = 0.0
 
-    for group_indexes in by_length.values():
-        if len(group_indexes) < 2:
-            continue
+    if len(valid_indexes) >= 2:
+        vectors = [
+            list(transform_params_for_distance(sorted_profiles[idx].weights))
+            for idx in valid_indexes
+        ]
+        inv_cov = get_validated_fsrs6_inverse_covariance(vectors)
 
-        vectors = [list(sorted_profiles[i].weights) for i in group_indexes]
-        inv_cov = inverse_covariance_for_vectors(vectors)
-
-        for left_offset, left_idx in enumerate(group_indexes):
-            for right_offset, right_idx in enumerate(group_indexes):
+        for left_offset, left_idx in enumerate(valid_indexes):
+            for right_offset, right_idx in enumerate(valid_indexes):
                 if right_offset <= left_offset:
                     continue
 

@@ -1,7 +1,7 @@
+import pytest
+
 from fsrs_merge_advisor.distance import (
-    covariance_matrix,
-    inverse_covariance,
-    inverse_covariance_for_vectors,
+    get_validated_fsrs6_inverse_covariance,
     mahalanobis_distance,
 )
 from fsrs_merge_advisor.reference_covariance import (
@@ -10,35 +10,26 @@ from fsrs_merge_advisor.reference_covariance import (
 )
 
 
-def test_covariance_matrix_regularizes_diagonal():
-    rows = [[1.0, 2.0], [3.0, 4.0]]
-    cov = covariance_matrix(rows, regularization=0.1)
-
-    assert cov[0][0] > 0.1
-    assert cov[1][1] > 0.1
-
-
-def test_inverse_covariance_and_mahalanobis_positive():
-    rows = [[1.0, 2.0], [2.0, 2.5], [3.0, 4.0], [4.0, 5.0]]
-    inv_cov = inverse_covariance(rows)
-
-    dist = mahalanobis_distance([1.0, 2.0], [4.0, 5.0], inv_cov)
+def test_mahalanobis_positive_with_reference_inverse_covariance():
+    dist = mahalanobis_distance(
+        [1.0] * FSRS6_RECENCY_DIM,
+        [2.0] * FSRS6_RECENCY_DIM,
+        FSRS6_RECENCY_INV_COVARIANCE_21,
+    )
 
     assert dist > 0
 
 
-def test_inverse_covariance_for_vectors_uses_reference_for_21_params():
+def test_get_validated_fsrs6_inverse_covariance_uses_reference_for_21_params():
     rows = [[float(i)] * FSRS6_RECENCY_DIM for i in range(1, 4)]
 
-    inv_cov = inverse_covariance_for_vectors(rows)
+    inv_cov = get_validated_fsrs6_inverse_covariance(rows)
 
     assert inv_cov == FSRS6_RECENCY_INV_COVARIANCE_21
 
 
-def test_inverse_covariance_for_vectors_falls_back_for_other_dimensions():
+def test_get_validated_fsrs6_inverse_covariance_rejects_non_fsrs6_dimensions():
     rows = [[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]]
 
-    inv_cov = inverse_covariance_for_vectors(rows)
-
-    assert len(inv_cov) == 2
-    assert len(inv_cov[0]) == 2
+    with pytest.raises(ValueError, match="Not FSRS6 valid params"):
+        get_validated_fsrs6_inverse_covariance(rows)

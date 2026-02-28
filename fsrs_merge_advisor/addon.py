@@ -7,7 +7,13 @@ from aqt import mw
 from aqt.qt import QAction, QDialog, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout
 from aqt.utils import showInfo, showWarning
 
-from .analyzer import FSRSProfile, analyze_profiles, extract_fsrs_weights, pairwise_distance_matrix
+from .analyzer import (
+    FSRSProfile,
+    analyze_profiles,
+    extract_fsrs_weights,
+    is_fsrs6_valid_params,
+    pairwise_distance_matrix,
+)
 
 _ACTION_LABEL = "FSRS Preset Proximity"
 
@@ -183,6 +189,14 @@ def _show_pairwise_distances(profiles: list[FSRSProfile]) -> None:
     for row_idx, row_profile in enumerate(ordered_profiles):
         table.setVerticalHeaderItem(row_idx, QTableWidgetItem(row_profile.profile_name))
         for col_idx in range(len(ordered_profiles)):
+            col_profile = ordered_profiles[col_idx]
+            if not is_fsrs6_valid_params(row_profile.weights) or not is_fsrs6_valid_params(
+                col_profile.weights
+            ):
+                display = "Not FSRS6 valid params"
+                table.setItem(row_idx, col_idx, QTableWidgetItem(display))
+                continue
+
             value = distances[row_idx][col_idx]
             display = "-" if value is None else f"{value:.4f}"
             table.setItem(row_idx, col_idx, QTableWidgetItem(display))
@@ -215,12 +229,19 @@ def _show_results() -> None:
     )
 
     for row, result in enumerate(results):
-        nearest_name = result.nearest_profile_name or "-"
-        nearest_distance = "-" if result.nearest_distance is None else f"{result.nearest_distance:.4f}"
-        if result.should_share_preset is None:
+        if result.status_message:
+            nearest_name = "-"
+            nearest_distance = result.status_message
             share_preset = "-"
         else:
-            share_preset = "Yes" if result.should_share_preset else "No"
+            nearest_name = result.nearest_profile_name or "-"
+            nearest_distance = (
+                "-" if result.nearest_distance is None else f"{result.nearest_distance:.4f}"
+            )
+            if result.should_share_preset is None:
+                share_preset = "-"
+            else:
+                share_preset = "Yes" if result.should_share_preset else "No"
 
         table.setItem(row, 0, QTableWidgetItem(result.profile.profile_name))
         table.setItem(row, 1, QTableWidgetItem(_params_to_str(result.profile.weights)))
