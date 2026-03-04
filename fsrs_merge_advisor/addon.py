@@ -15,6 +15,7 @@ from aqt.qt import (
     QDialog,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -70,12 +71,34 @@ from .use_cases.preset_reoptimization import (
     changed_preset_deck_groups_for_reoptimization,
     preset_optimization_summary_message,
 )
+from .use_cases.first_review_split import (
+    FIRST_REVIEW_RATINGS,
+    is_first_review_split_deck_name,
+    normalize_card_ids_from_single_column_rows,
+    split_card_ids_by_first_review,
+    target_deck_names_for_first_review_split,
+    target_preset_names_for_first_review_split,
+)
+from .use_cases.preset_cleanup import empty_advisor_preset_candidates
+from .use_cases.evaluate_mergeability import (
+    align_group_indexes_by_overlap,
+    can_reuse_evaluate_cached_logloss,
+    cluster_logloss_groups_agglomerative,
+    evaluate_logloss_cache_key,
+    mergeable_pair_count,
+    symmetric_merge_score_matrix,
+)
 from .reference_covariance import FSRS6_RECENCY_MAHALANOBIS_SHARED_PRESET_THRESHOLD
 
 _ACTION_LABEL = "FSRS Preset Proximity"
 _DECK_ACTION_LABEL = "FSRS Deck Proximity (Computed)"
+_EVALUATE_MERGEABILITY_LABEL = "FSRS Mergeability (Evaluate)"
+_FIRST_REVIEW_SPLIT_LABEL = "FSRS Split Deck by First Review"
+_FIRST_REVIEW_UNSPLIT_LABEL = "FSRS Merge Back First Review Split"
+_CLEAN_EMPTY_PRESETS_LABEL = "FSRS Cleanup Empty Advisor Presets"
 _CACHE_FILE_NAME = "deck_params_cache.json"
 _PRESET_BACKUP_FILE_NAME = "deck_preset_backup.json"
+_EVALUATE_LOGLOSS_CACHE_FILE_NAME = "evaluate_logloss_cache.json"
 
 
 class _PaneScopedListWidget(QListWidget):
@@ -128,6 +151,31 @@ def _preferred_cache_file_path() -> Path:
 def _cache_file_candidates() -> list[Path]:
     preferred = _preferred_cache_file_path()
     legacy = _legacy_cache_file_path()
+    if preferred == legacy:
+        return [preferred]
+    return [preferred, legacy]
+
+
+def _legacy_evaluate_logloss_cache_file_path() -> Path:
+    return Path(__file__).resolve().parent / _EVALUATE_LOGLOSS_CACHE_FILE_NAME
+
+
+def _preferred_evaluate_logloss_cache_file_path() -> Path:
+    pm = getattr(mw, "pm", None)
+    profile_folder_getter = getattr(pm, "profileFolder", None)
+    if callable(profile_folder_getter):
+        try:
+            profile_folder = profile_folder_getter()
+            if isinstance(profile_folder, str) and profile_folder:
+                return Path(profile_folder) / _EVALUATE_LOGLOSS_CACHE_FILE_NAME
+        except Exception:
+            pass
+    return _legacy_evaluate_logloss_cache_file_path()
+
+
+def _evaluate_logloss_cache_file_candidates() -> list[Path]:
+    preferred = _preferred_evaluate_logloss_cache_file_path()
+    legacy = _legacy_evaluate_logloss_cache_file_path()
     if preferred == legacy:
         return [preferred]
     return [preferred, legacy]
@@ -218,6 +266,28 @@ def _load_deck_param_cache() -> dict[str, dict[str, Any]]:
     return {}
 
 
+def _load_evaluate_logloss_cache() -> dict[str, dict[str, Any]]:
+    preferred = _preferred_evaluate_logloss_cache_file_path()
+    for path in _evaluate_logloss_cache_file_candidates():
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        entries = payload.get("entries")
+        if not isinstance(entries, dict):
+            continue
+        normalized: dict[str, dict[str, Any]] = {}
+        for key, value in entries.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                normalized[key] = value
+        if normalized and path != preferred:
+            _save_evaluate_logloss_cache(normalized)
+        return normalized
+    return {}
+
+
 def _save_deck_param_cache(entries: Mapping[str, Mapping[str, Any]]) -> None:
     payload = {"version": 1, "entries": dict(entries)}
     path = _preferred_cache_file_path()
@@ -226,6 +296,16 @@ def _save_deck_param_cache(entries: Mapping[str, Mapping[str, Any]]) -> None:
         path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
     except Exception:
         # Ignore cache persistence errors; computation can proceed without cache.
+        pass
+
+
+def _save_evaluate_logloss_cache(entries: Mapping[str, Mapping[str, Any]]) -> None:
+    payload = {"version": 1, "entries": dict(entries)}
+    path = _preferred_evaluate_logloss_cache_file_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    except Exception:
         pass
 
 
@@ -258,6 +338,241 @@ def _review_count_for_deck_scope(
     count = mw.col.db.scalar(sql, *scope_ids)
     return int(count or 0)
 
+
+def _deck_id_for_name(deck_name: str) -> int | None:
+    for did, name in _deck_entries():
+        if name == deck_name:
+            return int(did)
+    return None
+
+
+def _as_positive_int(value: Any) -> int | None:
+    direct = _as_int(value)
+    if direct is not None and direct > 0:
+        return int(direct)
+    try:
+        converted = int(value)
+    except (TypeError, ValueError):
+        return None
+    return converted if converted > 0 else None
+
+
+def _ensure_deck_id_for_name(deck_name: str) -> int | None:
+    existing = _deck_id_for_name(deck_name)
+    if existing is not None:
+        return existing
+
+    deck_manager = getattr(mw.col, "decks", None)
+    if deck_manager is None:
+        return None
+
+    candidates: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = [
+        ("id_for_name", (deck_name,), {"create": True}),
+        ("id_for_name", (deck_name, True), {}),
+        ("id", (deck_name,), {"create": True}),
+        ("id", (deck_name, True), {}),
+        ("id", (deck_name,), {}),
+        ("idForName", (deck_name,), {}),
+        ("add_normal_deck_with_name", (deck_name,), {}),
+    ]
+    for method_name, args, kwargs in candidates:
+        method = getattr(deck_manager, method_name, None)
+        if method is None:
+            continue
+        try:
+            created = method(*args, **kwargs)
+        except Exception:
+            continue
+        deck_id = _as_positive_int(created)
+        if deck_id is not None:
+            return deck_id
+
+    return _deck_id_for_name(deck_name)
+
+
+def _cards_and_first_review_ease_for_decks(deck_ids: Sequence[int]) -> list[tuple[int, int | None]]:
+    normalized_deck_ids = sorted({int(did) for did in deck_ids if int(did) > 0})
+    if not normalized_deck_ids:
+        return []
+
+    placeholders = ",".join("?" for _ in normalized_deck_ids)
+    sql = (
+        "SELECT c.id, "
+        "(SELECT r.ease FROM revlog r WHERE r.cid = c.id ORDER BY r.id ASC LIMIT 1) "
+        "FROM cards c "
+        f"WHERE c.did IN ({placeholders})"
+    )
+    rows = mw.col.db.all(sql, *normalized_deck_ids)
+
+    normalized_rows: list[tuple[int, int | None]] = []
+    for raw_card_id, raw_first_ease in rows:
+        card_id = _as_positive_int(raw_card_id)
+        if card_id is None:
+            continue
+        first_ease = _as_int(raw_first_ease)
+        normalized_rows.append((card_id, first_ease))
+    return normalized_rows
+
+
+def _card_ids_for_decks(deck_ids: Sequence[int]) -> list[int]:
+    normalized_deck_ids = sorted({int(did) for did in deck_ids if int(did) > 0})
+    if not normalized_deck_ids:
+        return []
+
+    placeholders = ",".join("?" for _ in normalized_deck_ids)
+    sql = f"SELECT id FROM cards WHERE did IN ({placeholders})"
+    db_list = getattr(mw.col.db, "list", None)
+    if callable(db_list):
+        try:
+            return normalize_card_ids_from_single_column_rows(
+                db_list(sql, *normalized_deck_ids)
+            )
+        except Exception:
+            pass
+    return normalize_card_ids_from_single_column_rows(
+        mw.col.db.all(sql, *normalized_deck_ids)
+    )
+
+
+def _deck_exists(deck_id: int) -> bool:
+    try:
+        return mw.col.decks.get(int(deck_id)) is not None
+    except Exception:
+        return False
+
+
+def _delete_deck_by_id(deck_id: int) -> bool:
+    if deck_id <= 0:
+        return False
+    deck_manager = getattr(mw.col, "decks", None)
+    if deck_manager is None:
+        return False
+
+    method_calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = [
+        ("remove", ([int(deck_id)],), {"cards_too": False}),
+        ("remove", ([int(deck_id)],), {"cardsToo": False}),
+        ("remove", ([int(deck_id)], False), {}),
+        ("remove", ([int(deck_id)], False, True), {}),
+        ("rem", ([int(deck_id)],), {"cardsToo": False, "childrenToo": True}),
+        ("rem", ([int(deck_id)], False, True), {}),
+        ("rem", ([int(deck_id)], False), {}),
+    ]
+
+    for method_name, args, kwargs in method_calls:
+        method = getattr(deck_manager, method_name, None)
+        if method is None:
+            continue
+        try:
+            method(*args, **kwargs)
+        except Exception:
+            continue
+        if not _deck_exists(int(deck_id)):
+            return True
+
+    return not _deck_exists(int(deck_id))
+
+
+def _delete_preset_by_id(conf_id: int) -> bool:
+    if conf_id <= 0:
+        return False
+    deck_manager = getattr(mw.col, "decks", None)
+    if deck_manager is None:
+        return False
+
+    method_calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = [
+        ("remove_config", (int(conf_id),), {}),
+        ("remove_config", ([int(conf_id)],), {}),
+        ("remove_config_id", (int(conf_id),), {}),
+        ("rem_config", (int(conf_id),), {}),
+        ("remConfig", (int(conf_id),), {}),
+        ("remConf", (int(conf_id),), {}),
+    ]
+
+    def _preset_exists() -> bool:
+        return any(existing_id == int(conf_id) for existing_id, _name, _cfg in _all_preset_configs())
+
+    if not _preset_exists():
+        return True
+
+    for method_name, args, kwargs in method_calls:
+        method = getattr(deck_manager, method_name, None)
+        if method is None:
+            continue
+        try:
+            method(*args, **kwargs)
+        except Exception:
+            continue
+        if not _preset_exists():
+            return True
+
+    return not _preset_exists()
+
+
+def _move_cards_to_deck(
+    *,
+    card_ids: Sequence[int],
+    target_deck_id: int,
+) -> tuple[int, int]:
+    normalized = sorted({int(card_id) for card_id in card_ids if int(card_id) > 0})
+    if not normalized:
+        return 0, 0
+
+    set_deck = getattr(mw.col, "set_deck", None)
+    if callable(set_deck):
+        call_patterns: list[tuple[tuple[Any, ...], dict[str, Any]]] = [
+            ((list(normalized), int(target_deck_id)), {}),
+            ((), {"cids": list(normalized), "did": int(target_deck_id)}),
+            ((), {"card_ids": list(normalized), "deck_id": int(target_deck_id)}),
+        ]
+        for args, kwargs in call_patterns:
+            try:
+                if kwargs:
+                    set_deck(**kwargs)
+                else:
+                    set_deck(*args)
+                return len(normalized), 0
+            except Exception:
+                continue
+
+    get_card = getattr(mw.col, "get_card", None)
+    if get_card is None:
+        get_card = getattr(mw.col, "getCard", None)
+    update_card = getattr(mw.col, "update_card", None)
+    if update_card is None:
+        update_card = getattr(mw.col, "updateCard", None)
+    if callable(get_card) and callable(update_card):
+        moved = 0
+        failed = 0
+        for card_id in normalized:
+            try:
+                card = get_card(card_id)
+                if card is None:
+                    failed += 1
+                    continue
+                current_did = _as_int(_field(card, "did"))
+                if current_did == int(target_deck_id):
+                    continue
+                if isinstance(card, Mapping):
+                    card["did"] = int(target_deck_id)
+                else:
+                    setattr(card, "did", int(target_deck_id))
+                update_card(card)
+                moved += 1
+            except Exception:
+                failed += 1
+        return moved, failed
+
+    try:
+        placeholders = ",".join("?" for _ in normalized)
+        mw.col.db.execute(
+            f"UPDATE cards SET did = ? WHERE id IN ({placeholders})",
+            int(target_deck_id),
+            *normalized,
+        )
+        return len(normalized), 0
+    except Exception:
+        return 0, len(normalized)
+
 def _load_profiles() -> list[FSRSProfile]:
     profiles: list[FSRSProfile] = []
 
@@ -276,6 +591,13 @@ def _to_float_sequence(value: Any) -> tuple[float, ...] | None:
         return None
     try:
         return tuple(float(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return None
 
@@ -350,6 +672,52 @@ def _compute_fsrs_params_for_deck(
         params = ()
     fsrs_items = _as_int(_field_any(response, ("fsrs_items", "fsrsItems"))) or 0
     return params, fsrs_items
+
+
+def _evaluate_logloss_with_params(
+    *,
+    params: Sequence[float],
+    search: str,
+) -> float:
+    backend = getattr(mw.col, "_backend", None)
+    evaluate = getattr(backend, "evaluate_params_legacy", None)
+    if evaluate is None:
+        evaluate = getattr(backend, "evaluateParamsLegacy", None)
+    if evaluate is None:
+        raise RuntimeError("evaluate_params_legacy backend endpoint is unavailable")
+
+    candidates = [
+        {
+            "params": list(params),
+            "search": search,
+            "ignore_revlogs_before_ms": 0,
+        },
+        {
+            "params": list(params),
+            "search": search,
+            "ignoreRevlogsBeforeMs": 0,
+        },
+    ]
+
+    response = None
+    last_type_error: Exception | None = None
+    for kwargs in candidates:
+        try:
+            response = evaluate(**kwargs)
+            break
+        except TypeError as exc:
+            last_type_error = exc
+            continue
+
+    if response is None:
+        if last_type_error is not None:
+            raise RuntimeError("Unable to call evaluate_params_legacy with known argument names") from last_type_error
+        raise RuntimeError("evaluate_params_legacy failed without a result")
+
+    log_loss = _to_float(_field_any(response, ("log_loss", "logLoss")))
+    if log_loss is None:
+        raise RuntimeError("evaluate_params_legacy response did not include log_loss")
+    return float(log_loss)
 
 
 def _optimize_preset_configs(
@@ -1197,6 +1565,50 @@ def _show_similarity_groups(
     revert_backup_button.clicked.connect(_revert_preset_backup)
     buttons_layout.addWidget(revert_backup_button)
 
+    def _maybe_offer_reoptimization_for_changed_presets(
+        *,
+        before_assignments: Mapping[int, int],
+        target_by_deck: Mapping[int, int],
+        candidate_preset_ids: Sequence[int],
+    ) -> None:
+        after_target_assignments = _current_preset_assignments(list(target_by_deck.keys()))
+        all_deck_ids = [deck_id for deck_id, _deck_name in _deck_entries()]
+        all_current_assignments = _current_preset_assignments(all_deck_ids)
+        changed_preset_deck_groups = changed_preset_deck_groups_for_reoptimization(
+            before_assignments=before_assignments,
+            after_target_assignments=after_target_assignments,
+            target_by_deck=target_by_deck,
+            candidate_preset_ids=candidate_preset_ids,
+            all_current_assignments=all_current_assignments,
+        )
+        if not changed_preset_deck_groups:
+            return
+
+        optimize_choice = QMessageBox.question(
+            dialog,
+            "Optimize Changed Presets?",
+            "Do you want to optimize FSRS params for advisor presets whose deck composition changed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if optimize_choice != QMessageBox.StandardButton.Yes:
+            return
+
+        optimized, no_data, invalid_params, optimization_failed, cancelled = (
+            _optimize_preset_configs(changed_preset_deck_groups)
+        )
+        message = preset_optimization_summary_message(
+            optimized=optimized,
+            no_data=no_data,
+            invalid_params=invalid_params,
+            failed=optimization_failed,
+            cancelled=cancelled,
+        )
+        if optimization_failed:
+            showWarning(message)
+        else:
+            showInfo(message)
+
     recommended_button = QPushButton("Use Recommended Group", dialog)
 
     def _use_recommended_groups() -> None:
@@ -1321,39 +1733,11 @@ def _show_similarity_groups(
                 "Reopen this window to refresh existing preset groups."
             )
 
-        after_target_assignments = _current_preset_assignments(list(target_by_deck.keys()))
-        all_deck_ids = [deck_id for deck_id, _deck_name in _deck_entries()]
-        all_current_assignments = _current_preset_assignments(all_deck_ids)
-        changed_preset_deck_groups = changed_preset_deck_groups_for_reoptimization(
+        _maybe_offer_reoptimization_for_changed_presets(
             before_assignments=before_assignments,
-            after_target_assignments=after_target_assignments,
             target_by_deck=target_by_deck,
             candidate_preset_ids=recommended_conf_ids,
-            all_current_assignments=all_current_assignments,
         )
-        if changed_preset_deck_groups:
-            optimize_choice = QMessageBox.question(
-                dialog,
-                "Optimize Changed Presets?",
-                "Do you want to optimize FSRS params for advisor presets whose deck composition changed?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes,
-            )
-            if optimize_choice == QMessageBox.StandardButton.Yes:
-                optimized, no_data, invalid_params, optimization_failed, cancelled = (
-                    _optimize_preset_configs(changed_preset_deck_groups)
-                )
-                message = preset_optimization_summary_message(
-                    optimized=optimized,
-                    no_data=no_data,
-                    invalid_params=invalid_params,
-                    failed=optimization_failed,
-                    cancelled=cancelled,
-                )
-                if optimization_failed:
-                    showWarning(message)
-                else:
-                    showInfo(message)
         dialog.accept()
 
     recommended_button.clicked.connect(_use_recommended_groups)
@@ -1369,7 +1753,8 @@ def _show_similarity_groups(
                 if 0 <= deck_idx < len(deck_ids):
                     target_by_deck[deck_ids[deck_idx]] = preset_id
 
-        _save_preset_backup(_current_preset_assignments(list(target_by_deck.keys())))
+        before_assignments = _current_preset_assignments(list(target_by_deck.keys()))
+        _save_preset_backup(before_assignments)
         changed, failed = _apply_preset_assignments(target_by_deck)
 
         if failed:
@@ -1378,6 +1763,13 @@ def _show_similarity_groups(
             showInfo(f"Preset changes applied to {changed} decks.")
         else:
             showInfo("No preset changes to save.")
+
+        candidate_preset_ids = sorted({int(conf_id) for conf_id in target_by_deck.values()})
+        _maybe_offer_reoptimization_for_changed_presets(
+            before_assignments=before_assignments,
+            target_by_deck=target_by_deck,
+            candidate_preset_ids=candidate_preset_ids,
+        )
 
     save_button.clicked.connect(_save_preset_changes)
     buttons_layout.addWidget(save_button)
@@ -1526,6 +1918,946 @@ def _show_deck_computed_results() -> None:
     )
 
 
+def _split_deck_by_first_review() -> None:
+    entries = sorted(_deck_entries(), key=lambda item: item[1].lower())
+    if not entries:
+        showWarning("No decks available.")
+        return
+
+    deck_names = [name for _deck_id, name in entries]
+    selected_name, accepted = QInputDialog.getItem(
+        mw,
+        _FIRST_REVIEW_SPLIT_LABEL,
+        "Select source deck:",
+        deck_names,
+        0,
+        False,
+    )
+    if not accepted or not selected_name:
+        return
+
+    selected_deck_name = str(selected_name)
+    selected_deck_id = next(
+        (int(deck_id) for deck_id, name in entries if name == selected_deck_name),
+        None,
+    )
+    if selected_deck_id is None:
+        showWarning("Selected deck was not found.")
+        return
+
+    scope_deck_ids = descendant_deck_ids(entries, selected_deck_name)
+    if not scope_deck_ids:
+        scope_deck_ids = [selected_deck_id]
+
+    rows = _cards_and_first_review_ease_for_decks(scope_deck_ids)
+    if not rows:
+        showInfo(f'No cards found in "{selected_deck_name}".')
+        return
+
+    buckets, no_first_review_count, unexpected_rating_count = split_card_ids_by_first_review(
+        card_first_ease_rows=rows
+    )
+    target_deck_names = target_deck_names_for_first_review_split(selected_deck_name)
+    target_preset_names = target_preset_names_for_first_review_split(selected_deck_name)
+    split_counts = {
+        label: len(buckets[rating])
+        for rating, label in FIRST_REVIEW_RATINGS
+    }
+    total_split = sum(split_counts.values())
+
+    confirmation_lines = [
+        f'Source deck: "{selected_deck_name}"',
+        f"Cards in scope: {len(rows)}",
+        f"Again: {split_counts['Again']}",
+        f"Hard: {split_counts['Hard']}",
+        f"Good: {split_counts['Good']}",
+        f"Easy: {split_counts['Easy']}",
+    ]
+    if no_first_review_count:
+        confirmation_lines.append(f"No first review: {no_first_review_count} (left unchanged)")
+    if unexpected_rating_count:
+        confirmation_lines.append(
+            f"Unexpected first rating: {unexpected_rating_count} (left unchanged)"
+        )
+
+    proceed = QMessageBox.question(
+        mw,
+        _FIRST_REVIEW_SPLIT_LABEL,
+        "\n".join(confirmation_lines) + "\n\nProceed with split?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.Yes,
+    )
+    if proceed != QMessageBox.StandardButton.Yes:
+        return
+
+    moved_counts: dict[str, int] = {label: 0 for _rating, label in FIRST_REVIEW_RATINGS}
+    failed_count = 0
+    failed_target_decks: list[str] = []
+    failed_target_presets: list[str] = []
+    created_presets = 0
+    reused_presets = 0
+    target_preset_assignments: dict[int, int] = {}
+    create_config_id = getattr(mw.col.decks, "add_config_returning_id", None)
+    create_config = getattr(mw.col.decks, "add_config", None)
+    source_config = _config_for_deck(selected_deck_id)
+    existing_presets_by_name: dict[str, int] = {}
+    for conf_id, conf_name, _config in _all_preset_configs():
+        if conf_name not in existing_presets_by_name:
+            existing_presets_by_name[conf_name] = int(conf_id)
+
+    for rating, label in FIRST_REVIEW_RATINGS:
+        target_name = target_deck_names[rating]
+        target_deck_id = _ensure_deck_id_for_name(target_name)
+        if target_deck_id is None:
+            failed_target_decks.append(target_name)
+            failed_count += len(buckets[rating])
+            continue
+
+        preset_name = target_preset_names[rating]
+        preset_id = existing_presets_by_name.get(preset_name)
+        if preset_id is None:
+            try:
+                if create_config_id is not None:
+                    preset_id = int(create_config_id(preset_name, clone_from=source_config))
+                elif create_config is not None:
+                    new_config = create_config(preset_name, clone_from=source_config)
+                    preset_id = _as_int(_field(new_config, "id"))
+                else:
+                    preset_id = None
+            except Exception:
+                preset_id = None
+
+            if preset_id is None:
+                failed_target_presets.append(preset_name)
+                failed_count += len(buckets[rating])
+                continue
+            created_presets += 1
+            existing_presets_by_name[preset_name] = int(preset_id)
+        else:
+            reused_presets += 1
+
+        target_preset_assignments[int(target_deck_id)] = int(preset_id)
+        moved, failed = _move_cards_to_deck(
+            card_ids=buckets[rating],
+            target_deck_id=target_deck_id,
+        )
+        moved_counts[label] = moved
+        failed_count += failed
+
+    preset_assign_changed = 0
+    preset_assign_failed = 0
+    if target_preset_assignments:
+        preset_assign_changed, preset_assign_failed = _apply_preset_assignments(target_preset_assignments)
+        failed_count += preset_assign_failed
+
+    if total_split > 0:
+        try:
+            mw.reset()
+        except Exception:
+            pass
+
+    result_lines = [
+        f'Split completed for "{selected_deck_name}".',
+        f"Moved Again: {moved_counts['Again']}",
+        f"Moved Hard: {moved_counts['Hard']}",
+        f"Moved Good: {moved_counts['Good']}",
+        f"Moved Easy: {moved_counts['Easy']}",
+        (
+            f"Presets: created {created_presets}, reused {reused_presets}, "
+            f"assigned {preset_assign_changed}"
+        ),
+    ]
+    if no_first_review_count:
+        result_lines.append(f"Unchanged (no first review): {no_first_review_count}")
+    if unexpected_rating_count:
+        result_lines.append(f"Unchanged (unexpected first rating): {unexpected_rating_count}")
+    if failed_target_decks:
+        result_lines.append("Failed to create/find target decks:")
+        for deck_name in failed_target_decks:
+            result_lines.append(f"- {deck_name}")
+    if failed_target_presets:
+        result_lines.append("Failed to create/find target presets:")
+        for preset_name in failed_target_presets:
+            result_lines.append(f"- {preset_name}")
+    if failed_count:
+        showWarning("\n".join(result_lines + [f"Move failures: {failed_count}"]))
+        return
+    showInfo("\n".join(result_lines))
+
+
+def _merge_back_first_review_split() -> None:
+    entries = sorted(_deck_entries(), key=lambda item: item[1].lower())
+    if not entries:
+        showWarning("No decks available.")
+        return
+
+    deck_names = [
+        name for _deck_id, name in entries if not is_first_review_split_deck_name(name)
+    ]
+    if not deck_names:
+        showWarning("No base deck available to merge into.")
+        return
+
+    selected_name, accepted = QInputDialog.getItem(
+        mw,
+        _FIRST_REVIEW_UNSPLIT_LABEL,
+        "Select base deck:",
+        deck_names,
+        0,
+        False,
+    )
+    if not accepted or not selected_name:
+        return
+
+    base_deck_name = str(selected_name)
+    base_deck_id = next(
+        (int(deck_id) for deck_id, name in entries if name == base_deck_name),
+        None,
+    )
+    if base_deck_id is None:
+        showWarning("Selected deck was not found.")
+        return
+
+    split_deck_names = target_deck_names_for_first_review_split(base_deck_name)
+    per_label_cards: dict[str, list[int]] = {}
+    existing_split_decks = 0
+    for _rating, label in FIRST_REVIEW_RATINGS:
+        split_name = split_deck_names[_rating]
+        split_scope_ids = descendant_deck_ids(entries, split_name)
+        if not split_scope_ids:
+            direct_id = next(
+                (int(deck_id) for deck_id, name in entries if name == split_name),
+                None,
+            )
+            if direct_id is not None:
+                split_scope_ids = [direct_id]
+        if not split_scope_ids:
+            per_label_cards[label] = []
+            continue
+        existing_split_decks += 1
+        per_label_cards[label] = _card_ids_for_decks(split_scope_ids)
+
+    if existing_split_decks == 0:
+        showInfo(f'No "{base_deck_name} - Again/Hard/Good/Easy" decks found.')
+        return
+
+    total_to_merge = sum(len(card_ids) for card_ids in per_label_cards.values())
+    if total_to_merge <= 0:
+        showInfo("Split decks exist, but there are no cards to merge back.")
+        return
+
+    confirmation_lines = [
+        f'Base deck: "{base_deck_name}"',
+        f"Again -> base: {len(per_label_cards['Again'])}",
+        f"Hard -> base: {len(per_label_cards['Hard'])}",
+        f"Good -> base: {len(per_label_cards['Good'])}",
+        f"Easy -> base: {len(per_label_cards['Easy'])}",
+        f"Total cards to merge back: {total_to_merge}",
+    ]
+    proceed = QMessageBox.question(
+        mw,
+        _FIRST_REVIEW_UNSPLIT_LABEL,
+        "\n".join(confirmation_lines) + "\n\nProceed with merge back?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.Yes,
+    )
+    if proceed != QMessageBox.StandardButton.Yes:
+        return
+
+    merged_counts: dict[str, int] = {label: 0 for _rating, label in FIRST_REVIEW_RATINGS}
+    failed_count = 0
+    for _rating, label in FIRST_REVIEW_RATINGS:
+        moved, failed = _move_cards_to_deck(
+            card_ids=per_label_cards[label],
+            target_deck_id=base_deck_id,
+        )
+        merged_counts[label] = moved
+        failed_count += failed
+
+    try:
+        mw.reset()
+    except Exception:
+        pass
+
+    deleted_split_decks: list[str] = []
+    delete_failed_split_decks: list[str] = []
+    refreshed_entries = sorted(_deck_entries(), key=lambda item: item[1].lower())
+    for _rating, label in FIRST_REVIEW_RATINGS:
+        split_name = split_deck_names[_rating]
+        split_scope_ids = descendant_deck_ids(refreshed_entries, split_name)
+        if not split_scope_ids:
+            continue
+        if _card_ids_for_decks(split_scope_ids):
+            continue
+        root_id = next(
+            (int(deck_id) for deck_id, name in refreshed_entries if name == split_name),
+            None,
+        )
+        if root_id is None:
+            continue
+        if _delete_deck_by_id(root_id):
+            deleted_split_decks.append(split_name)
+        else:
+            delete_failed_split_decks.append(split_name)
+
+    result_lines = [
+        f'Merged cards back into "{base_deck_name}".',
+        f"Merged Again: {merged_counts['Again']}",
+        f"Merged Hard: {merged_counts['Hard']}",
+        f"Merged Good: {merged_counts['Good']}",
+        f"Merged Easy: {merged_counts['Easy']}",
+        f"Total merged: {sum(merged_counts.values())}",
+    ]
+    if deleted_split_decks:
+        result_lines.append(f"Deleted empty split decks: {len(deleted_split_decks)}")
+    if delete_failed_split_decks:
+        result_lines.append("Failed to delete empty split decks:")
+        for deck_name in delete_failed_split_decks:
+            result_lines.append(f"- {deck_name}")
+    if failed_count:
+        showWarning("\n".join(result_lines + [f"Move failures: {failed_count}"]))
+        return
+    showInfo("\n".join(result_lines))
+
+
+def _cleanup_empty_advisor_presets() -> None:
+    all_presets = [(int(conf_id), str(conf_name)) for conf_id, conf_name, _cfg in _all_preset_configs()]
+    all_deck_ids = [int(deck_id) for deck_id, _deck_name in _deck_entries()]
+    current_assignments = _current_preset_assignments(all_deck_ids)
+    used_preset_ids = sorted({int(conf_id) for conf_id in current_assignments.values()})
+
+    candidates = empty_advisor_preset_candidates(
+        presets=all_presets,
+        used_preset_ids=used_preset_ids,
+    )
+    if not candidates:
+        showInfo("No empty advisor presets to clean.")
+        return
+
+    preview_limit = 15
+    preview = [f"- {name}" for _conf_id, name in candidates[:preview_limit]]
+    remaining = len(candidates) - len(preview)
+    if remaining > 0:
+        preview.append(f"... and {remaining} more")
+
+    proceed = QMessageBox.question(
+        mw,
+        _CLEAN_EMPTY_PRESETS_LABEL,
+        (
+            f"Found {len(candidates)} empty advisor preset(s) not assigned to any deck.\n\n"
+            + "\n".join(preview)
+            + "\n\nDelete them?"
+        ),
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.Yes,
+    )
+    if proceed != QMessageBox.StandardButton.Yes:
+        return
+
+    deleted = 0
+    failed: list[str] = []
+    for conf_id, conf_name in candidates:
+        if _delete_preset_by_id(conf_id):
+            deleted += 1
+        else:
+            failed.append(conf_name)
+
+    try:
+        mw.reset()
+    except Exception:
+        pass
+
+    if failed:
+        lines = [
+            f"Deleted {deleted} preset(s), failed to delete {len(failed)}.",
+            "Failed presets:",
+        ]
+        lines.extend(f"- {name}" for name in failed)
+        showWarning("\n".join(lines))
+        return
+
+    showInfo(f"Deleted {deleted} empty advisor preset(s).")
+
+
+def _show_mergeability_evaluation() -> None:
+    choice = QMessageBox.question(
+        mw,
+        _EVALUATE_MERGEABILITY_LABEL,
+        "Default scope is leaf decks only.\n\n"
+        "Do you also want to include middle/root decks for the computation?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No,
+    )
+    include_middle_and_root = choice == QMessageBox.StandardButton.Yes
+    progress = QProgressDialog("Preparing deck optimizations...", "Cancel", 0, 100, mw)
+    progress.setWindowTitle(_EVALUATE_MERGEABILITY_LABEL)
+    progress.setAutoClose(False)
+    progress.setAutoReset(False)
+    progress.setMinimumDuration(0)
+    progress.setValue(0)
+
+    def _progress_callback(done: int, total: int, deck_name: str | None) -> bool:
+        progress.setMaximum(max(total, 0))
+        progress.setValue(min(done, total))
+        progress.setLabelText(
+            optimization_progress_message(done=done, total=total, deck_name=deck_name)
+        )
+        progress.show()
+        progress.repaint()
+        mw.app.processEvents()
+        progress.repaint()
+        return not progress.wasCanceled()
+
+    try:
+        profiles, no_data_decks, invalid_param_decks, failed_decks, cancelled = (
+            _load_computed_deck_profiles(
+                include_middle_and_root=include_middle_and_root,
+                progress_callback=_progress_callback,
+            )
+        )
+    finally:
+        progress.close()
+
+    if cancelled and not profiles:
+        showWarning("Deck optimization cancelled.")
+        return
+    if cancelled:
+        showInfo("Deck optimization cancelled. Showing partial results.")
+    if len(profiles) < 2:
+        showWarning("At least 2 decks with usable FSRS6 computed parameters are required.")
+        return
+
+    notes: list[str] = []
+    if no_data_decks:
+        notes.append(f"Skipped (no FSRS items): {len(no_data_decks)}")
+    if invalid_param_decks:
+        notes.append(f"Skipped (non-FSRS6 params): {len(invalid_param_decks)}")
+    if failed_decks:
+        notes.append(f"Skipped (compute failure): {len(failed_decks)}")
+    if notes:
+        showInfo("Deck computation notes:\n" + "\n".join(notes))
+
+    ordered_profiles = sorted(profiles, key=lambda profile: profile.profile_name.lower())
+    labels = [profile.profile_name for profile in ordered_profiles]
+    entries = sorted(_deck_entries(), key=lambda item: item[1].lower())
+    searches = [
+        build_deck_search_query(
+            deck_id=profile.profile_id,
+            deck_name=profile.profile_name,
+            include_children=include_middle_and_root,
+        )
+        for profile in ordered_profiles
+    ]
+    review_counts = [
+        _review_count_for_deck_scope(
+            deck_id=profile.profile_id,
+            deck_name=profile.profile_name,
+            include_children=include_middle_and_root,
+            entries=entries,
+        )
+        for profile in ordered_profiles
+    ]
+
+    total_evals = len(ordered_profiles) * len(ordered_profiles)
+    eval_progress = QProgressDialog("Evaluating mergeability logloss...", "Cancel", 0, total_evals, mw)
+    eval_progress.setWindowTitle(_EVALUATE_MERGEABILITY_LABEL)
+    eval_progress.setAutoClose(False)
+    eval_progress.setAutoReset(False)
+    eval_progress.setMinimumDuration(0)
+    eval_progress.setValue(0)
+    evaluate_cache = _load_evaluate_logloss_cache()
+    evaluate_cache_dirty = False
+
+    losses: list[list[float | None]] = [
+        [None for _ in range(len(ordered_profiles))] for _ in range(len(ordered_profiles))
+    ]
+    eval_failed = 0
+    done = 0
+    cancelled_eval = False
+    try:
+        for target_idx, target_profile in enumerate(ordered_profiles):
+            for source_idx, source_profile in enumerate(ordered_profiles):
+                eval_progress.setValue(done)
+                eval_progress.setLabelText(
+                    f'Evaluating "{target_profile.profile_name}" with params from '
+                    f'"{source_profile.profile_name}"\nCompleted: {done}/{total_evals}'
+                )
+                eval_progress.show()
+                eval_progress.repaint()
+                mw.app.processEvents()
+                eval_progress.repaint()
+                if eval_progress.wasCanceled():
+                    cancelled_eval = True
+                    break
+                cache_key = evaluate_logloss_cache_key(
+                    target_deck_id=target_profile.profile_id,
+                    include_children=include_middle_and_root,
+                    source_params=source_profile.weights,
+                )
+                cached_entry = evaluate_cache.get(cache_key, {})
+                cached_review_count = _as_int(cached_entry.get("review_count"))
+                cached_log_loss = _to_float(cached_entry.get("log_loss"))
+                if can_reuse_evaluate_cached_logloss(
+                    cached_review_count=cached_review_count,
+                    current_review_count=review_counts[target_idx],
+                    cached_log_loss=cached_log_loss,
+                ):
+                    losses[target_idx][source_idx] = cached_log_loss
+                    done += 1
+                    continue
+                try:
+                    computed_log_loss = _evaluate_logloss_with_params(
+                        params=source_profile.weights,
+                        search=searches[target_idx],
+                    )
+                    losses[target_idx][source_idx] = computed_log_loss
+                    evaluate_cache[cache_key] = {
+                        "review_count": review_counts[target_idx],
+                        "log_loss": computed_log_loss,
+                    }
+                    evaluate_cache_dirty = True
+                except Exception:
+                    eval_failed += 1
+                    losses[target_idx][source_idx] = None
+                done += 1
+            if cancelled_eval:
+                break
+    finally:
+        eval_progress.close()
+    if evaluate_cache_dirty:
+        _save_evaluate_logloss_cache(evaluate_cache)
+
+    if cancelled_eval and done == 0:
+        showWarning("Mergeability evaluation cancelled.")
+        return
+    if cancelled_eval:
+        showInfo("Mergeability evaluation cancelled. Showing partial results.")
+    if eval_failed:
+        showWarning(f"Mergeability evaluation had {eval_failed} failed logloss evaluations.")
+
+    score_matrix = symmetric_merge_score_matrix(losses=losses, review_counts=review_counts)
+    maha_ordered_profiles, maha_raw_matrix = pairwise_distance_matrix(ordered_profiles)
+    profile_index_by_id = {
+        profile.profile_id: idx for idx, profile in enumerate(maha_ordered_profiles)
+    }
+    maha_matrix: list[list[float | None]] = [
+        [None for _ in range(len(ordered_profiles))] for _ in range(len(ordered_profiles))
+    ]
+    for row_idx, row_profile in enumerate(ordered_profiles):
+        mapped_row = profile_index_by_id.get(row_profile.profile_id)
+        if mapped_row is None:
+            continue
+        for col_idx, col_profile in enumerate(ordered_profiles):
+            mapped_col = profile_index_by_id.get(col_profile.profile_id)
+            if mapped_col is None:
+                continue
+            maha_matrix[row_idx][col_idx] = maha_raw_matrix[mapped_row][mapped_col]
+
+    preset_groups_map: dict[int, dict[str, Any]] = {}
+    for idx, profile in enumerate(ordered_profiles):
+        config = _config_for_deck(profile.profile_id)
+        conf_id = _as_int(_field(config, "id"))
+        if conf_id is None:
+            deck = mw.col.decks.get(profile.profile_id)
+            conf_id = _as_int(_field_any(deck, ("conf", "config_id")))
+        if conf_id is None:
+            continue
+        preset_name = _config_name(conf_id, config) if config is not None else f"Preset {conf_id}"
+        group = preset_groups_map.get(conf_id)
+        if group is None:
+            preset_groups_map[conf_id] = {"name": preset_name, "indexes": [idx]}
+        else:
+            group["indexes"].append(idx)
+    current_preset_groups = sorted(
+        [
+            (
+                int(conf_id),
+                str(data["name"]),
+                [int(v) for v in data["indexes"]],
+            )
+            for conf_id, data in preset_groups_map.items()
+        ],
+        key=lambda item: item[1].lower(),
+    )
+
+    dialog = QDialog(mw)
+    dialog.setWindowTitle(f"{_EVALUATE_MERGEABILITY_LABEL} - Group Comparison")
+    layout = QVBoxLayout(dialog)
+
+    summary_label = QLabel(dialog)
+    summary_label.setWordWrap(True)
+    layout.addWidget(summary_label)
+
+    sliders_layout = QHBoxLayout()
+    orientation_enum = getattr(Qt, "Orientation", None)
+    horizontal = orientation_enum.Horizontal if orientation_enum is not None else Qt.Horizontal
+    maha_slider_layout = QHBoxLayout()
+    maha_slider_layout.addWidget(QLabel("Mahalanobis Threshold:", dialog))
+    maha_slider = QSlider(horizontal, dialog)
+    maha_slider.setMinimum(1)
+    maha_slider.setMaximum(100)
+    maha_slider.setSingleStep(1)
+    maha_slider.setValue(int(round(FSRS6_RECENCY_MAHALANOBIS_SHARED_PRESET_THRESHOLD * 10)))
+    maha_slider_layout.addWidget(maha_slider)
+    maha_value_label = QLabel(dialog)
+    maha_slider_layout.addWidget(maha_value_label)
+    sliders_layout.addLayout(maha_slider_layout)
+
+    logloss_slider_layout = QHBoxLayout()
+    logloss_slider_layout.addWidget(QLabel("LogLoss Delta Threshold:", dialog))
+    logloss_slider = QSlider(horizontal, dialog)
+    logloss_slider.setMinimum(0)
+    logloss_slider.setMaximum(50)
+    logloss_slider.setSingleStep(1)
+    logloss_slider.setValue(3)
+    logloss_slider_layout.addWidget(logloss_slider)
+    logloss_value_label = QLabel(dialog)
+    logloss_slider_layout.addWidget(logloss_value_label)
+    sliders_layout.addLayout(logloss_slider_layout)
+    layout.addLayout(sliders_layout)
+
+    panels_layout = QHBoxLayout()
+    layout.addLayout(panels_layout)
+
+    current_scroll = QScrollArea(dialog)
+    current_scroll.setWidgetResizable(True)
+    current_container = QWidget(current_scroll)
+    current_layout = QVBoxLayout(current_container)
+    current_header = QLabel("Current Preset", current_container)
+    current_layout.addWidget(current_header)
+    current_summary = QLabel(current_container)
+    current_summary.setWordWrap(True)
+    current_layout.addWidget(current_summary)
+    current_scroll.setWidget(current_container)
+    panels_layout.addWidget(current_scroll)
+
+    maha_scroll = QScrollArea(dialog)
+    maha_scroll.setWidgetResizable(True)
+    maha_container = QWidget(maha_scroll)
+    maha_layout = QVBoxLayout(maha_container)
+    maha_header = QLabel("Mahalanobis Distance", maha_container)
+    maha_layout.addWidget(maha_header)
+    maha_summary = QLabel(maha_container)
+    maha_summary.setWordWrap(True)
+    maha_layout.addWidget(maha_summary)
+    maha_scroll.setWidget(maha_container)
+    panels_layout.addWidget(maha_scroll)
+
+    logloss_scroll = QScrollArea(dialog)
+    logloss_scroll.setWidgetResizable(True)
+    logloss_container = QWidget(logloss_scroll)
+    logloss_layout = QVBoxLayout(logloss_container)
+    logloss_header = QLabel("LogLoss Proximity", logloss_container)
+    logloss_layout.addWidget(logloss_header)
+    logloss_summary = QLabel(logloss_container)
+    logloss_summary.setWordWrap(True)
+    logloss_layout.addWidget(logloss_summary)
+    logloss_scroll.setWidget(logloss_container)
+    panels_layout.addWidget(logloss_scroll)
+
+    current_group_boxes: list[QGroupBox] = []
+    maha_group_boxes: list[QGroupBox] = []
+    logloss_group_boxes: list[QGroupBox] = []
+    active_maha_groups: list[list[int]] = []
+    active_logloss_groups: list[list[int]] = []
+    maha_apply_button = QPushButton("Use this split", maha_container)
+    logloss_apply_button = QPushButton("Use this split", logloss_container)
+    maha_layout.addWidget(maha_apply_button)
+    logloss_layout.addWidget(logloss_apply_button)
+
+    def _clear_group_boxes(target: list[QGroupBox], panel_layout: QVBoxLayout, summary: QLabel) -> None:
+        for group_box in target:
+            panel_layout.removeWidget(group_box)
+            group_box.deleteLater()
+        target.clear()
+
+    def _render_groups(
+        *,
+        panel_layout: QVBoxLayout,
+        summary: QLabel,
+        target: list[QGroupBox],
+        groups: Sequence[Sequence[int]],
+        header_text: str,
+        distances: Sequence[Sequence[float | None]] | None = None,
+        threshold: float | None = None,
+        display_names_by_group: Sequence[Sequence[str]] | None = None,
+        insert_before_widget: QWidget | None = None,
+    ) -> None:
+        _clear_group_boxes(target, panel_layout, summary)
+        summary.setText(header_text)
+        selection_mode_enum = getattr(QAbstractItemView, "SelectionMode", None)
+        no_selection = (
+            selection_mode_enum.NoSelection
+            if selection_mode_enum is not None
+            else QAbstractItemView.NoSelection
+        )
+        for group_number, group_indexes in enumerate(groups, start=1):
+            max_text = "n/a"
+            if distances is not None:
+                max_value = max_pairwise_distance_for_group(
+                    group_indexes=group_indexes,
+                    distances=distances,
+                )
+                if max_value is not None:
+                    max_text = f"{max_value:.4f}"
+            title = f"Group {group_number} (Max: {max_text})"
+            if threshold is not None and max_text != "n/a":
+                title += f" / <= {threshold:.4f}"
+            box = QGroupBox(title, panel_layout.parentWidget())
+            box_layout = QVBoxLayout(box)
+            deck_list = QListWidget(box)
+            deck_list.setSelectionMode(no_selection)
+            if display_names_by_group is not None and (group_number - 1) < len(display_names_by_group):
+                for display_name in display_names_by_group[group_number - 1]:
+                    QListWidgetItem(str(display_name), deck_list)
+            else:
+                for idx in group_indexes:
+                    if 0 <= idx < len(labels):
+                        QListWidgetItem(labels[idx], deck_list)
+            box_layout.addWidget(deck_list)
+            if insert_before_widget is not None:
+                insert_index = panel_layout.indexOf(insert_before_widget)
+                if insert_index < 0:
+                    panel_layout.addWidget(box)
+                else:
+                    panel_layout.insertWidget(insert_index, box)
+            else:
+                panel_layout.addWidget(box)
+            target.append(box)
+
+    current_group_indexes = [group[2] for group in current_preset_groups if group[2]]
+    _render_groups(
+        panel_layout=current_layout,
+        summary=current_summary,
+        target=current_group_boxes,
+        groups=current_group_indexes,
+        header_text=f"{len(current_group_indexes)} current preset groups",
+        distances=maha_matrix,
+    )
+
+    total_pairs = (len(labels) * (len(labels) - 1)) // 2
+
+    def _group_indexes_from_names(group_names: Sequence[Sequence[str]]) -> list[list[int]]:
+        index_by_name = {name: idx for idx, name in enumerate(labels)}
+        return [[index_by_name[name] for name in group if name in index_by_name] for group in group_names]
+
+    def _apply_split_to_presets(*, split_label: str, group_indexes: Sequence[Sequence[int]]) -> None:
+        create_config_id = getattr(mw.col.decks, "add_config_returning_id", None)
+        create_config = getattr(mw.col.decks, "add_config", None)
+
+        existing_by_name: dict[str, int] = {}
+        for conf_id, conf_name, _ in _all_preset_configs():
+            if conf_name not in existing_by_name:
+                existing_by_name[conf_name] = int(conf_id)
+
+        created = 0
+        reused = 0
+        failed = 0
+        target_by_deck: dict[int, int] = {}
+        applied_conf_ids: list[int] = []
+
+        for group_number, indexes in enumerate(group_indexes, start=1):
+            valid_indexes = [idx for idx in indexes if 0 <= idx < len(ordered_profiles)]
+            if not valid_indexes:
+                continue
+
+            base_name = f"FSRS Preset Advisor : {split_label} Group {group_number}"
+            new_conf_id = existing_by_name.get(base_name)
+            if new_conf_id is not None:
+                reused += 1
+            else:
+                clone_from = None
+                for idx in valid_indexes:
+                    profile_deck_id = ordered_profiles[idx].profile_id
+                    conf = _config_for_deck(profile_deck_id)
+                    if conf is not None:
+                        clone_from = conf
+                        break
+                try:
+                    if create_config_id is not None:
+                        new_conf_id = int(create_config_id(base_name, clone_from=clone_from))
+                    elif create_config is not None:
+                        new_conf = create_config(base_name, clone_from=clone_from)
+                        new_conf_id = _as_int(_field(new_conf, "id"))
+                        if new_conf_id is None:
+                            raise RuntimeError("Created preset has no id")
+                    else:
+                        raise RuntimeError("Preset creation API unavailable")
+                except Exception:
+                    failed += len(valid_indexes)
+                    continue
+                created += 1
+                existing_by_name[base_name] = int(new_conf_id)
+
+            for idx in valid_indexes:
+                deck_id = ordered_profiles[idx].profile_id
+                target_by_deck[int(deck_id)] = int(new_conf_id)
+            if int(new_conf_id) not in applied_conf_ids:
+                applied_conf_ids.append(int(new_conf_id))
+
+        if not target_by_deck:
+            showInfo(f"No groups available to apply for {split_label}.")
+            return
+
+        before_assignments = _current_preset_assignments(list(target_by_deck.keys()))
+        _save_preset_backup(before_assignments)
+        assigned, apply_failed = _apply_preset_assignments(target_by_deck)
+        failed += apply_failed
+
+        if failed:
+            showWarning(
+                f"{split_label}: created {created} groups, reused {reused} groups, "
+                f"reassigned {assigned} decks, with {failed} failures."
+            )
+        else:
+            showInfo(
+                f"{split_label}: created {created} groups, reused {reused} groups, "
+                f"reassigned {assigned} decks."
+            )
+
+        after_target_assignments = _current_preset_assignments(list(target_by_deck.keys()))
+        all_deck_ids = [deck_id for deck_id, _deck_name in _deck_entries()]
+        all_current_assignments = _current_preset_assignments(all_deck_ids)
+        changed_preset_deck_groups = changed_preset_deck_groups_for_reoptimization(
+            before_assignments=before_assignments,
+            after_target_assignments=after_target_assignments,
+            target_by_deck=target_by_deck,
+            candidate_preset_ids=applied_conf_ids,
+            all_current_assignments=all_current_assignments,
+        )
+        if not changed_preset_deck_groups:
+            return
+        optimize_choice = QMessageBox.question(
+            dialog,
+            "Optimize Changed Presets?",
+            "Do you want to optimize FSRS params for advisor presets whose deck composition changed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if optimize_choice != QMessageBox.StandardButton.Yes:
+            return
+        optimized, no_data, invalid_params, optimization_failed, cancelled = (
+            _optimize_preset_configs(changed_preset_deck_groups)
+        )
+        message = preset_optimization_summary_message(
+            optimized=optimized,
+            no_data=no_data,
+            invalid_params=invalid_params,
+            failed=optimization_failed,
+            cancelled=cancelled,
+        )
+        if optimization_failed:
+            showWarning(message)
+        else:
+            showInfo(message)
+
+    def _refresh_group_panels() -> None:
+        nonlocal active_maha_groups, active_logloss_groups
+        maha_threshold = float(maha_slider.value()) / 10.0
+        logloss_threshold = float(logloss_slider.value()) / 1000.0
+        maha_value_label.setText(f"{maha_threshold:.1f}")
+        logloss_value_label.setText(f"{logloss_threshold:.3f}")
+
+        maha_groups_names = similarity_groups_from_matrix(
+            names=labels,
+            distances=maha_matrix,
+            threshold=maha_threshold,
+            min_group_size=1,
+        )
+        maha_groups = _group_indexes_from_names(maha_groups_names)
+        active_maha_groups = [list(group) for group in maha_groups]
+        maha_mergeable = mergeable_pair_count(score_matrix=maha_matrix, threshold=maha_threshold)
+
+        logloss_groups = cluster_logloss_groups_agglomerative(
+            losses=losses,
+            review_counts=review_counts,
+            threshold=logloss_threshold,
+        )
+        active_logloss_groups = [list(group) for group in logloss_groups]
+        logloss_mergeable = mergeable_pair_count(score_matrix=score_matrix, threshold=logloss_threshold)
+
+        aligned_pairs = align_group_indexes_by_overlap(
+            left_groups=maha_groups,
+            right_groups=logloss_groups,
+        )
+        ordered_maha_groups = [
+            maha_groups[left_idx] for left_idx, _right_idx in aligned_pairs if left_idx is not None
+        ]
+        ordered_logloss_groups = [
+            logloss_groups[right_idx]
+            for _left_idx, right_idx in aligned_pairs
+            if right_idx is not None
+        ]
+        display_maha_groups: list[list[str]] = []
+        display_logloss_groups: list[list[str]] = []
+        for left_idx, right_idx in aligned_pairs:
+            left_group = maha_groups[left_idx] if left_idx is not None else []
+            right_group = logloss_groups[right_idx] if right_idx is not None else []
+            common = set(left_group) & set(right_group)
+
+            if left_idx is not None:
+                display_maha_groups.append(
+                    [
+                        f'{"= " if idx in common else "- "}{labels[idx]}'
+                        for idx in left_group
+                    ]
+                )
+            if right_idx is not None:
+                display_logloss_groups.append(
+                    [
+                        f'{"= " if idx in common else "+ "}{labels[idx]}'
+                        for idx in right_group
+                    ]
+                )
+
+        _render_groups(
+            panel_layout=maha_layout,
+            summary=maha_summary,
+            target=maha_group_boxes,
+            groups=ordered_maha_groups,
+            header_text=f"{len(maha_groups)} groups, mergeable pairs: {maha_mergeable}/{total_pairs}",
+            distances=maha_matrix,
+            threshold=maha_threshold,
+            display_names_by_group=display_maha_groups,
+            insert_before_widget=maha_apply_button,
+        )
+        _render_groups(
+            panel_layout=logloss_layout,
+            summary=logloss_summary,
+            target=logloss_group_boxes,
+            groups=ordered_logloss_groups,
+            header_text=(
+                f"{len(logloss_groups)} groups, mergeable pairs: "
+                f"{logloss_mergeable}/{total_pairs}"
+            ),
+            distances=score_matrix,
+            threshold=logloss_threshold,
+            display_names_by_group=display_logloss_groups,
+            insert_before_widget=logloss_apply_button,
+        )
+
+        summary_label.setText(
+            f"Decks: {len(labels)}. "
+            f"Mahalanobis threshold: {maha_threshold:.1f}. "
+            f"LogLoss delta threshold: {logloss_threshold:.3f}."
+        )
+
+    maha_apply_button.clicked.connect(
+        lambda: _apply_split_to_presets(split_label="Mahalanobis", group_indexes=active_maha_groups)
+    )
+
+    logloss_apply_button.clicked.connect(
+        lambda: _apply_split_to_presets(split_label="LogLoss", group_indexes=active_logloss_groups)
+    )
+
+    maha_slider.valueChanged.connect(_refresh_group_panels)
+    logloss_slider.valueChanged.connect(_refresh_group_panels)
+    _refresh_group_panels()
+
+    dialog.resize(1300, 900)
+    dialog.exec()
+
+
 def init_addon() -> None:
     preset_action = QAction(_ACTION_LABEL, mw)
     preset_action.triggered.connect(_show_preset_results)
@@ -1534,3 +2866,19 @@ def init_addon() -> None:
     deck_action = QAction(_DECK_ACTION_LABEL, mw)
     deck_action.triggered.connect(_show_deck_computed_results)
     mw.form.menuTools.addAction(deck_action)
+
+    first_review_split_action = QAction(_FIRST_REVIEW_SPLIT_LABEL, mw)
+    first_review_split_action.triggered.connect(_split_deck_by_first_review)
+    mw.form.menuTools.addAction(first_review_split_action)
+
+    first_review_unsplit_action = QAction(_FIRST_REVIEW_UNSPLIT_LABEL, mw)
+    first_review_unsplit_action.triggered.connect(_merge_back_first_review_split)
+    mw.form.menuTools.addAction(first_review_unsplit_action)
+
+    cleanup_presets_action = QAction(_CLEAN_EMPTY_PRESETS_LABEL, mw)
+    cleanup_presets_action.triggered.connect(_cleanup_empty_advisor_presets)
+    mw.form.menuTools.addAction(cleanup_presets_action)
+
+    evaluate_action = QAction(_EVALUATE_MERGEABILITY_LABEL, mw)
+    evaluate_action.triggered.connect(_show_mergeability_evaluation)
+    mw.form.menuTools.addAction(evaluate_action)

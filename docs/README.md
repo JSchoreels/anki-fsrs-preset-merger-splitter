@@ -32,3 +32,8 @@
 ## Handoff
 
 See `docs/HANDOFF.md` for feature-level status, design decisions, persistence files, and pending work.
+
+## Call Flow Diagrams
+
+PlantUML sequence diagrams for key runtime paths are in:
+- `docs/CALL_FLOWS.puml`
